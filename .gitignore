@@ -1,0 +1,27 @@
+Set-Content -Encoding utf8 .gitignore @'
+# Node
+node_modules/
+worker/node_modules/
+
+# Builds
+dist/
+worker/dist/
+
+# Local DB
+data/*.db*
+data/*.sqlite*
+
+# Cloudflare/Wrangler
+.wrangler/
+worker/.wrangler/
+
+# Logs / env
+*.log
+.env
+worker/.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+'@

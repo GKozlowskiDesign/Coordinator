@@ -6,6 +6,8 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { Connection, PublicKey, VersionedTransactionResponse } from '@solana/web3.js';
 import { paywall } from './x402-paywall';
+import { AI_MODELS } from './ai-models';
+
 
 const PER_DEVICE_PRICE = process.env.SURVEY_DEVICE_PRICE_USDC || '0.25';
 
@@ -99,6 +101,28 @@ db.exec(`
     site_label TEXT,
     enabled INTEGER DEFAULT 0
   );
+
+    CREATE TABLE IF NOT EXISTS ai_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    host_id TEXT,
+    prompt TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result TEXT,
+    error TEXT,
+    created_ts INTEGER NOT NULL,
+    updated_ts INTEGER NOT NULL,
+    taken_device_id TEXT,
+    taken_ts INTEGER
+  );
+
+
+  -- PUTE credits (AI paywall balance)
+  CREATE TABLE IF NOT EXISTS pute_credits (
+    wallet TEXT PRIMARY KEY,
+    total INTEGER NOT NULL
+  );
 `);
 
 // ---- MIGRATE older DBs (order matters!) ------------------------------------
@@ -115,19 +139,19 @@ try {
 } catch {}
 
 createIndexIfMissing(
-  `CREATE INDEX IF NOT EXISTS idx_shares_ts ON shares(ts DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_shares_ts ON shares(ts DESC)`
 );
 createIndexIfMissing(
-  `CREATE INDEX IF NOT EXISTS idx_shares_wallet ON shares(wallet)`,
+  `CREATE INDEX IF NOT EXISTS idx_shares_wallet ON shares(wallet)`
 );
 createIndexIfMissing(
-  `CREATE INDEX IF NOT EXISTS idx_shares_host ON shares(host_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_shares_host ON shares(host_id)`
 );
 createIndexIfMissing(
-  `CREATE INDEX IF NOT EXISTS idx_shares_device ON shares(device_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_shares_device ON shares(device_id)`
 );
 createIndexIfMissing(
-  `CREATE UNIQUE INDEX IF NOT EXISTS ux_hosts_attached_device ON hosts(attached_device_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS ux_hosts_attached_device ON hosts(attached_device_id)`
 );
 
 // ---------- prepared statements ---------------------------------------------
@@ -169,6 +193,65 @@ const getMarketHosts = db.prepare(`
   WHERE
     h.enabled = 1
     AND h.attached_device_id IS NOT NULL
+`);
+
+// ---- AI job queue ----------------------------------------------------------
+const insertAiJob = db.prepare(`
+  INSERT INTO ai_jobs (
+    wallet,
+    model_id,
+    host_id,
+    prompt,
+    status,
+    created_ts,
+    updated_ts
+  )
+  VALUES (@wallet, @modelId, @hostId, @prompt, @status, @createdTs, @updatedTs)
+`);
+
+const getAiJob = db.prepare(`
+  SELECT *
+  FROM ai_jobs
+  WHERE id = ?
+`);
+
+const claimNextAiJob = db.prepare(`
+  UPDATE ai_jobs
+  SET
+    status = 'running',
+    host_id = COALESCE(host_id, @hostId),
+    taken_device_id = @deviceId,
+    taken_ts = @now,
+    updated_ts = @now
+  WHERE id = (
+    SELECT id
+    FROM ai_jobs
+    WHERE status = 'queued'
+      AND (host_id IS NULL OR host_id = @hostId)
+    ORDER BY created_ts ASC
+    LIMIT 1
+  )
+  RETURNING *
+`);
+
+const completeAiJob = db.prepare(`
+  UPDATE ai_jobs
+  SET
+    status = @status,
+    result = @result,
+    error = @error,
+    updated_ts = @now
+  WHERE id = @id
+`);
+
+
+// PUTE credits prepared statements
+const getPuteCredit = db.prepare(
+  `SELECT total FROM pute_credits WHERE wallet = ?`,
+);
+const upsertPuteCredit = db.prepare(`
+  INSERT INTO pute_credits (wallet, total) VALUES (@wallet, @total)
+  ON CONFLICT(wallet) DO UPDATE SET total = excluded.total
 `);
 
 // ---------- SSE --------------------------------------------------------------
@@ -287,7 +370,7 @@ app.post('/host/hello', (req, res) => {
   return res.json({ ok: true, bound: true, hostId, deviceId, wallet });
 });
 
-// ---------- SURVEY SUBMIT (paywalled) ---------------------------------------
+// ---------- SURVEY SUBMIT (paywalled via x402-paywall) -----------------------
 app.post(
   '/surveys/:surveyId/devices/:deviceNumber/submit',
   paywall(
@@ -380,7 +463,7 @@ app.post('/share', (req, res) => {
   res.json({ ok: true, ...payload });
 });
 
-// ---------- Read API ---------------------------------------------------------
+// ---------- Read API: mining credits / shares / stats ------------------------
 app.get('/credits/:wallet', (req, res) => {
   const row = getCredit.get(req.params.wallet) as
     | { total: number }
@@ -388,7 +471,7 @@ app.get('/credits/:wallet', (req, res) => {
   res.json({ wallet: req.params.wallet, total: row?.total || 0 });
 });
 
-/** Settle credits after an airdrop claim */
+/** Settle mining credits after an airdrop claim */
 app.post('/credits/settle', (req, res) => {
   try {
     const wallet = String(req.body?.wallet || '');
@@ -447,6 +530,7 @@ app.get('/stats', (_req, res) => {
   });
 });
 
+// ---------- Host read APIs ---------------------------------------------------
 app.get('/host-state', (req, res) => {
   const hostId = String(req.query.hostId || '');
   if (!hostId)
@@ -615,6 +699,62 @@ app.post('/host/disable', (req, res) => {
   res.json({ ok: true, hostId, enabled: false });
 });
 
+// ---------- PUTE credits: deposit + balance ----------------------------------
+
+// For now, 1 lamport = 1 PUTE unit (you can change this later with an env).
+// If you want a different rate, set PUTE_PER_LAMPORT in the environment.
+const PUTE_PER_LAMPORT = Number(process.env.PUTE_PER_LAMPORT || '1');
+
+app.post('/pute/deposit', (req, res) => {
+  try {
+    const wallet = String(req.body?.wallet || '');
+    const lamportsRaw = req.body?.lamports;
+    const modelId = req.body?.modelId || null;
+    const uiTxId = req.body?.uiTxId || null;
+
+    const lamports = Number(lamportsRaw);
+    if (!wallet) {
+      return res.status(400).json({ ok: false, error: 'wallet_required' });
+    }
+    if (!Number.isFinite(lamports) || lamports <= 0) {
+      return res.status(400).json({ ok: false, error: 'bad_amount' });
+    }
+
+    const minted = Math.floor(lamports * PUTE_PER_LAMPORT);
+
+    const row = getPuteCredit.get(wallet) as { total?: number } | undefined;
+    const cur = Math.max(0, Number(row?.total ?? 0));
+    const next = cur + minted;
+
+    upsertPuteCredit.run({ wallet, total: next });
+
+    return res.json({
+      ok: true,
+      wallet,
+      lamports,
+      minted,
+      total: next,
+      modelId,
+      uiTxId,
+    });
+  } catch (e: any) {
+    console.error('/pute/deposit error', e?.message || e);
+    return res
+      .status(500)
+      .json({ ok: false, error: 'internal_error' });
+  }
+});
+
+app.get('/pute/:wallet', (req, res) => {
+  const wallet = String(req.params.wallet || '');
+  if (!wallet) {
+    return res.status(400).json({ ok: false, error: 'wallet_required' });
+  }
+  const row = getPuteCredit.get(wallet) as { total?: number } | undefined;
+  const total = Math.max(0, Number(row?.total ?? 0));
+  res.json({ ok: true, wallet, total });
+});
+
 // ---------- On-chain START/STOP verify via Memo ------------------------------
 const RPC_URL =
   process.env.SOLANA_RPC || 'https://api.devnet.solana.com';
@@ -726,8 +866,149 @@ app.get('/healthz', (_req, res) => {
   });
 });
 
+app.get('/ai/models', (_req, res) => {
+  res.json({ models: AI_MODELS });
+});
+
 const port = process.env.PORT || 8787;
 app.listen(port, () => {
   console.log(`[db] coordinator listening on :${port}`);
   console.log(`[db] DB: ${DB_PATH}`);
 });
+
+// ---------- AI JOB QUEUE (LLM work) -----------------------------------------
+
+/**
+ * Enqueue a new AI job from the UI.
+ * body: { wallet, modelId, prompt, hostId? }
+ */
+app.post('/ai/jobs', (req, res) => {
+  try {
+    const { wallet, modelId, prompt, hostId } = req.body || {};
+    if (!wallet || !modelId || !prompt) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'wallet, modelId, prompt required' });
+    }
+
+    const now = Date.now();
+    const info = insertAiJob.run({
+      wallet: String(wallet),
+      modelId: String(modelId),
+      hostId: hostId ? String(hostId) : null,
+      prompt: String(prompt),
+      status: 'queued',
+      createdTs: now,
+      updatedTs: now,
+    });
+
+    const id = Number(info.lastInsertRowid);
+    return res.json({ ok: true, id });
+  } catch (e: any) {
+    console.error('/ai/jobs error', e?.message || e);
+    return res
+      .status(500)
+      .json({ ok: false, error: 'ai_jobs_internal_error' });
+  }
+});
+
+/**
+ * Claim the next queued job for a given host/device.
+ * query: ?hostId=HOST-...&deviceId=...
+ */
+app.get('/ai/jobs/next', (req, res) => {
+  try {
+    const hostId = String(req.query.hostId || '');
+    const deviceId = String(req.query.deviceId || '');
+    if (!hostId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'hostId_required' });
+    }
+
+    const now = Date.now();
+    const row = claimNextAiJob.get({
+      hostId,
+      deviceId: deviceId || null,
+      now,
+    }) as any | undefined;
+
+    return res.json({
+      ok: true,
+      job: row || null,
+    });
+  } catch (e: any) {
+    console.error('/ai/jobs/next error', e?.message || e);
+    return res
+      .status(500)
+      .json({ ok: false, error: 'ai_jobs_next_internal_error' });
+  }
+});
+
+/**
+ * Fetch job by id (for UI polling).
+ */
+app.get('/ai/jobs/:id', (req, res) => {
+  try {
+    const id = Number(req.params.id || 0);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'bad_job_id' });
+    }
+    const row = getAiJob.get(id) as any | undefined;
+    if (!row) {
+      return res
+        .status(404)
+        .json({ ok: false, error: 'job_not_found' });
+    }
+    return res.json({ ok: true, job: row });
+  } catch (e: any) {
+    console.error('/ai/jobs/:id error', e?.message || e);
+    return res
+      .status(500)
+      .json({ ok: false, error: 'ai_jobs_get_internal_error' });
+  }
+});
+
+/**
+ * Worker posts back result when done.
+ * body: { result?: string, error?: string }
+ */
+app.post('/ai/jobs/:id/result', (req, res) => {
+  try {
+    const id = Number(req.params.id || 0);
+    const { result, error } = req.body || {};
+    if (!Number.isFinite(id) || id <= 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'bad_job_id' });
+    }
+
+    const row = getAiJob.get(id) as any | undefined;
+    if (!row) {
+      return res
+        .status(404)
+        .json({ ok: false, error: 'job_not_found' });
+    }
+
+    const now = Date.now();
+    const status = error ? 'failed' : 'completed';
+
+    completeAiJob.run({
+      id,
+      status,
+      result: result ?? null,
+      error: error ?? null,
+      now,
+    });
+
+    return res.json({ ok: true, id, status });
+  } catch (e: any) {
+    console.error('/ai/jobs/:id/result error', e?.message || e);
+    return res
+      .status(500)
+      .json({ ok: false, error: 'ai_jobs_result_internal_error' });
+  }
+});
+

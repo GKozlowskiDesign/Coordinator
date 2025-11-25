@@ -5,9 +5,22 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { Connection, PublicKey, VersionedTransactionResponse } from '@solana/web3.js';
+// CHANGED: Removed 'node:' prefix for compatibility
+import { spawn, ChildProcess } from 'child_process'; 
+
 import { paywall } from './x402-paywall';
 import { AI_MODELS } from './ai-models';
 
+// =============================================================================
+// 📱 REMOTE CONTROL CONFIGURATION
+// =============================================================================
+
+// !!! IMPORTANT: CHANGE THIS TO THE PATH OF YOUR MINER FOLDER !!!
+const MINER_PATH = 'C:\\Users\\gkozl\\Desktop\\Miner'; 
+
+let minerProcess: ChildProcess | null = null;
+
+// =============================================================================
 
 const PER_DEVICE_PRICE = process.env.SURVEY_DEVICE_PRICE_USDC || '0.25';
 
@@ -16,9 +29,6 @@ app.set('trust proxy', 1);
 
 /**
  * CORS
- * Configure allowed web origins via:
- *   APP_ORIGINS="https://elevator-network-d-app.vercel.app,http://localhost:3000"
- * or set NEXT_PUBLIC_APP_ORIGIN for a single origin.
  */
 const rawOrigins =
   process.env.APP_ORIGINS ||
@@ -26,19 +36,13 @@ const rawOrigins =
   'http://localhost:3000';
 
 const ALLOWED_ORIGINS = rawOrigins.split(',').map((s) => s.trim()).filter(Boolean);
-
-// also allow Vercel previews (optional)
 const ALLOW_VERCEL_PREVIEWS = true;
 
 const corsOptions: cors.CorsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // server-to-server
+    if (!origin) return cb(null, true); 
     const host = (() => {
-      try {
-        return new URL(origin).hostname;
-      } catch {
-        return '';
-      }
+      try { return new URL(origin).hostname; } catch { return ''; }
     })();
     const ok =
       ALLOWED_ORIGINS.includes(origin) ||
@@ -58,8 +62,16 @@ const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_PATH = path.join(DATA_DIR, 'coordinator.db');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+// WRAPPED in try/catch to debug database locks
+let db: Database.Database;
+try {
+  db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  console.log(`[db] Connected to ${DB_PATH}`);
+} catch (err) {
+  console.error('[db] FATAL: Could not open database. Is another process using it?', err);
+  process.exit(1);
+}
 
 // ---- helpers for migrations -------------------------------------------------
 function tableHasColumn(table: string, column: string): boolean {
@@ -73,7 +85,7 @@ function addColumnIfMissing(table: string, column: string, declNoConstraints: st
   }
 }
 function createIndexIfMissing(sql: string) {
-  db.exec(sql); // requires IF NOT EXISTS in SQL
+  db.exec(sql); 
 }
 
 // ---- create tables if they never existed -----------------------------------
@@ -117,20 +129,16 @@ db.exec(`
     taken_ts INTEGER
   );
 
-
-  -- PUTE credits (AI paywall balance)
   CREATE TABLE IF NOT EXISTS pute_credits (
     wallet TEXT PRIMARY KEY,
     total INTEGER NOT NULL
   );
 `);
 
-// ---- MIGRATE older DBs (order matters!) ------------------------------------
+// ---- MIGRATE older DBs ------------------------------------
 addColumnIfMissing('shares', 'device_id', 'TEXT');
 addColumnIfMissing('hosts', 'attached_device_id', 'TEXT');
 addColumnIfMissing('hosts', 'site_label', 'TEXT');
-
-// GPU-related metadata
 addColumnIfMissing('hosts', 'gpu_reported_model', 'TEXT');
 addColumnIfMissing('hosts', 'gpu_verified', 'INTEGER NOT NULL DEFAULT 0');
 
@@ -138,21 +146,11 @@ try {
   db.prepare(`UPDATE shares SET device_id='' WHERE device_id IS NULL`).run();
 } catch {}
 
-createIndexIfMissing(
-  `CREATE INDEX IF NOT EXISTS idx_shares_ts ON shares(ts DESC)`
-);
-createIndexIfMissing(
-  `CREATE INDEX IF NOT EXISTS idx_shares_wallet ON shares(wallet)`
-);
-createIndexIfMissing(
-  `CREATE INDEX IF NOT EXISTS idx_shares_host ON shares(host_id)`
-);
-createIndexIfMissing(
-  `CREATE INDEX IF NOT EXISTS idx_shares_device ON shares(device_id)`
-);
-createIndexIfMissing(
-  `CREATE UNIQUE INDEX IF NOT EXISTS ux_hosts_attached_device ON hosts(attached_device_id)`
-);
+createIndexIfMissing(`CREATE INDEX IF NOT EXISTS idx_shares_ts ON shares(ts DESC)`);
+createIndexIfMissing(`CREATE INDEX IF NOT EXISTS idx_shares_wallet ON shares(wallet)`);
+createIndexIfMissing(`CREATE INDEX IF NOT EXISTS idx_shares_host ON shares(host_id)`);
+createIndexIfMissing(`CREATE INDEX IF NOT EXISTS idx_shares_device ON shares(device_id)`);
+createIndexIfMissing(`CREATE UNIQUE INDEX IF NOT EXISTS ux_hosts_attached_device ON hosts(attached_device_id)`);
 
 // ---------- prepared statements ---------------------------------------------
 const insertShare = db.prepare(`
@@ -163,12 +161,8 @@ const upsertCredit = db.prepare(`
   INSERT INTO wallet_credits (wallet, total) VALUES (@wallet, @total)
   ON CONFLICT(wallet) DO UPDATE SET total = excluded.total
 `);
-const getCredit = db.prepare(
-  `SELECT total FROM wallet_credits WHERE wallet = ?`,
-);
-const setCredit = db.prepare(
-  `UPDATE wallet_credits SET total = ? WHERE wallet = ?`,
-);
+const getCredit = db.prepare(`SELECT total FROM wallet_credits WHERE wallet = ?`);
+const setCredit = db.prepare(`UPDATE wallet_credits SET total = ? WHERE wallet = ?`);
 
 const getRecent = db.prepare(`
   SELECT wallet, host_id as hostId, device_id as deviceId, difficulty, ts
@@ -198,22 +192,12 @@ const getMarketHosts = db.prepare(`
 // ---- AI job queue ----------------------------------------------------------
 const insertAiJob = db.prepare(`
   INSERT INTO ai_jobs (
-    wallet,
-    model_id,
-    host_id,
-    prompt,
-    status,
-    created_ts,
-    updated_ts
+    wallet, model_id, host_id, prompt, status, created_ts, updated_ts
   )
   VALUES (@wallet, @modelId, @hostId, @prompt, @status, @createdTs, @updatedTs)
 `);
 
-const getAiJob = db.prepare(`
-  SELECT *
-  FROM ai_jobs
-  WHERE id = ?
-`);
+const getAiJob = db.prepare(`SELECT * FROM ai_jobs WHERE id = ?`);
 
 const claimNextAiJob = db.prepare(`
   UPDATE ai_jobs
@@ -224,31 +208,21 @@ const claimNextAiJob = db.prepare(`
     taken_ts = @now,
     updated_ts = @now
   WHERE id = (
-    SELECT id
-    FROM ai_jobs
-    WHERE status = 'queued'
-      AND (host_id IS NULL OR host_id = @hostId)
-    ORDER BY created_ts ASC
-    LIMIT 1
+    SELECT id FROM ai_jobs
+    WHERE status = 'queued' AND (host_id IS NULL OR host_id = @hostId)
+    ORDER BY created_ts ASC LIMIT 1
   )
   RETURNING *
 `);
 
 const completeAiJob = db.prepare(`
   UPDATE ai_jobs
-  SET
-    status = @status,
-    result = @result,
-    error = @error,
-    updated_ts = @now
+  SET status = @status, result = @result, error = @error, updated_ts = @now
   WHERE id = @id
 `);
 
-
 // PUTE credits prepared statements
-const getPuteCredit = db.prepare(
-  `SELECT total FROM pute_credits WHERE wallet = ?`,
-);
+const getPuteCredit = db.prepare(`SELECT total FROM pute_credits WHERE wallet = ?`);
 const upsertPuteCredit = db.prepare(`
   INSERT INTO pute_credits (wallet, total) VALUES (@wallet, @total)
   ON CONFLICT(wallet) DO UPDATE SET total = excluded.total
@@ -262,9 +236,7 @@ let nextId = 1;
 function broadcast(event: string, payload: any) {
   const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const c of clients) {
-    try {
-      c.res.write(data);
-    } catch {}
+    try { c.res.write(data); } catch {}
   }
 }
 
@@ -284,174 +256,87 @@ app.get('/events', (_req, res) => {
   });
 });
 
-// ---------- Miner/device binding + GPU report --------------------------------
+// ---------- ROUTES -----------------------------------------------------------
+
 app.post('/host/hello', (req, res) => {
   const { hostId, deviceId, wallet, site, gpuModel } = req.body || {};
   if (!hostId || !deviceId || !wallet) {
-    return res
-      .status(400)
-      .json({ ok: false, error: 'hostId, deviceId and wallet required' });
+    return res.status(400).json({ ok: false, error: 'hostId, deviceId and wallet required' });
   }
 
-  const row = db
-    .prepare(
-      `
-    SELECT owner_wallet,
-           attached_wallet,
-           attached_device_id,
-           gpu_reported_model,
-           gpu_verified
-    FROM hosts WHERE host_id=?`,
-    )
-    .get(hostId) as
-    | {
-        owner_wallet: string;
-        attached_wallet?: string | null;
-        attached_device_id?: string | null;
-        gpu_reported_model?: string | null;
-        gpu_verified?: number | null;
-      }
-    | undefined;
+  const row = db.prepare(`
+    SELECT owner_wallet, attached_wallet, attached_device_id, gpu_reported_model, gpu_verified
+    FROM hosts WHERE host_id=?`
+  ).get(hostId) as any;
 
-  if (!row)
-    return res
-      .status(404)
-      .json({ ok: false, error: 'host_not_registered' });
+  if (!row) return res.status(404).json({ ok: false, error: 'host_not_registered' });
 
   const cleanedGpu = (gpuModel && String(gpuModel).trim()) || null;
 
   if (!row.attached_device_id) {
     try {
-      db.prepare(
-        `
+      db.prepare(`
         UPDATE hosts
-        SET attached_device_id = ?,
-            attached_wallet    = ?,
-            site_label         = COALESCE(?, site_label),
+        SET attached_device_id = ?, attached_wallet = ?, site_label = COALESCE(?, site_label),
             gpu_reported_model = COALESCE(?, gpu_reported_model),
-            gpu_verified       = CASE WHEN ? IS NOT NULL AND ? <> '' THEN 1 ELSE gpu_verified END
+            gpu_verified = CASE WHEN ? IS NOT NULL AND ? <> '' THEN 1 ELSE gpu_verified END
         WHERE host_id = ?
-      `,
-      ).run(deviceId, wallet, site || null, cleanedGpu, cleanedGpu, cleanedGpu, hostId);
+      `).run(deviceId, wallet, site || null, cleanedGpu, cleanedGpu, cleanedGpu, hostId);
       broadcast('host', { hostId });
-      return res.json({
-        ok: true,
-        bound: true,
-        hostId,
-        deviceId,
-        wallet,
-      });
+      return res.json({ ok: true, bound: true, hostId, deviceId, wallet });
     } catch {
-      return res
-        .status(409)
-        .json({ ok: false, error: 'device_bind_conflict' });
+      return res.status(409).json({ ok: false, error: 'device_bind_conflict' });
     }
   }
 
-  if (row.attached_device_id !== deviceId) {
-    return res
-      .status(403)
-      .json({ ok: false, error: 'device_mismatch' });
-  }
+  if (row.attached_device_id !== deviceId) return res.status(403).json({ ok: false, error: 'device_mismatch' });
 
   if (row.attached_wallet !== wallet || cleanedGpu !== row.gpu_reported_model) {
-    db.prepare(
-      `
+    db.prepare(`
       UPDATE hosts
-      SET attached_wallet    = ?,
-          gpu_reported_model = COALESCE(?, gpu_reported_model),
-          gpu_verified       = CASE WHEN ? IS NOT NULL AND ? <> '' THEN 1 ELSE gpu_verified END
+      SET attached_wallet = ?, gpu_reported_model = COALESCE(?, gpu_reported_model),
+          gpu_verified = CASE WHEN ? IS NOT NULL AND ? <> '' THEN 1 ELSE gpu_verified END
       WHERE host_id = ?
-    `,
-    ).run(wallet, cleanedGpu, cleanedGpu, cleanedGpu, hostId);
+    `).run(wallet, cleanedGpu, cleanedGpu, cleanedGpu, hostId);
     broadcast('host', { hostId });
   }
-
   return res.json({ ok: true, bound: true, hostId, deviceId, wallet });
 });
 
-// ---------- SURVEY SUBMIT (paywalled via x402-paywall) -----------------------
-app.post(
-  '/surveys/:surveyId/devices/:deviceNumber/submit',
+app.post('/surveys/:surveyId/devices/:deviceNumber/submit',
   paywall(
-    (req) =>
-      `survey:${req.params.surveyId}:device:${req.params.deviceNumber}:submit`,
+    (req) => `survey:${req.params.surveyId}:device:${req.params.deviceNumber}:submit`,
     { currency: 'USDC', value: PER_DEVICE_PRICE },
   ),
   async (req, res) => {
-    // Payment verified at this point.
-    // TODO: persist payload (answers, files metadata, etc.)
-    res.json({
-      ok: true,
-      surveyId: req.params.surveyId,
-      deviceNumber: req.params.deviceNumber,
-      paid: true,
-    });
+    res.json({ ok: true, surveyId: req.params.surveyId, deviceNumber: req.params.deviceNumber, paid: true });
   },
 );
 
-// ---------- Mining API (NO paywall) -----------------------------------------
 app.post('/share', (req, res) => {
   const { wallet, hostId, deviceId, difficulty = 1 } = req.body || {};
-  if (!wallet || !hostId || !deviceId) {
-    return res
-      .status(400)
-      .json({ error: 'wallet, hostId, deviceId required' });
-  }
+  if (!wallet || !hostId || !deviceId) return res.status(400).json({ error: 'wallet, hostId, deviceId required' });
 
-  const host = db
-    .prepare(
-      `
-    SELECT enabled,
-           owner_wallet,
-           controller_wallet,
-           attached_wallet,
-           attached_device_id,
-           gpu_reported_model,
-           gpu_verified
-    FROM hosts WHERE host_id=?`,
-    )
-    .get(hostId) as
-    | {
-        enabled: number;
-        owner_wallet: string;
-        controller_wallet?: string | null;
-        attached_wallet?: string | null;
-        attached_device_id?: string | null;
-        gpu_reported_model?: string | null;
-        gpu_verified?: number | null;
-      }
-    | undefined;
+  const host = db.prepare(`
+    SELECT enabled, owner_wallet, controller_wallet, attached_wallet, attached_device_id,
+           gpu_reported_model, gpu_verified
+    FROM hosts WHERE host_id=?`
+  ).get(hostId) as any;
 
   if (!host) return res.status(404).json({ error: 'unknown_host' });
-  if (Number(host.enabled) !== 1)
-    return res.status(403).json({ error: 'host_disabled' });
-  if (!host.attached_device_id || host.attached_device_id !== deviceId) {
-    return res
-      .status(403)
-      .json({ error: 'device_not_authorized' });
-  }
-
-  // GPU must be reported and verified
-  if (!host.gpu_reported_model || Number(host.gpu_verified ?? 0) !== 1) {
-    return res.status(403).json({ error: 'gpu_not_verified' });
-  }
+  if (Number(host.enabled) !== 1) return res.status(403).json({ error: 'host_disabled' });
+  if (!host.attached_device_id || host.attached_device_id !== deviceId) return res.status(403).json({ error: 'device_not_authorized' });
+  if (!host.gpu_reported_model || Number(host.gpu_verified ?? 0) !== 1) return res.status(403).json({ error: 'gpu_not_verified' });
 
   const allowedWallet = host.attached_wallet || host.owner_wallet;
-  if (allowedWallet && allowedWallet !== wallet) {
-    return res
-      .status(403)
-      .json({ error: 'wallet_not_authorized' });
-  }
+  if (allowedWallet && allowedWallet !== wallet) return res.status(403).json({ error: 'wallet_not_authorized' });
 
-  const diff = Number.isFinite(+difficulty)
-    ? Math.max(1, Number(difficulty))
-    : 1;
+  const diff = Number.isFinite(+difficulty) ? Math.max(1, Number(difficulty)) : 1;
   const ts = Date.now();
 
   const tx = db.transaction(() => {
     insertShare.run({ wallet, hostId, deviceId, difficulty: diff, ts });
-    const current = getCredit.get(wallet) as { total?: number } | undefined;
+    const current = getCredit.get(wallet) as any;
     const total = (current?.total || 0) + diff;
     upsertCredit.run({ wallet, total });
     return total;
@@ -463,30 +348,19 @@ app.post('/share', (req, res) => {
   res.json({ ok: true, ...payload });
 });
 
-// ---------- Read API: mining credits / shares / stats ------------------------
 app.get('/credits/:wallet', (req, res) => {
-  const row = getCredit.get(req.params.wallet) as
-    | { total: number }
-    | undefined;
+  const row = getCredit.get(req.params.wallet) as any;
   res.json({ wallet: req.params.wallet, total: row?.total || 0 });
 });
 
-/** Settle mining credits after an airdrop claim */
 app.post('/credits/settle', (req, res) => {
   try {
     const wallet = String(req.body?.wallet || '');
     const amount = Number(req.body?.amount || 0);
-    if (!wallet)
-      return res
-        .status(400)
-        .json({ ok: false, error: 'wallet_required' });
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'bad_amount' });
-    }
+    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet_required' });
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ ok: false, error: 'bad_amount' });
 
-    const curRow = getCredit.get(wallet) as { total?: number } | undefined;
+    const curRow = getCredit.get(wallet) as any;
     const cur = Math.max(0, Number(curRow?.total ?? 0));
     const next = Math.max(0, cur - Math.floor(amount));
 
@@ -496,31 +370,73 @@ app.post('/credits/settle', (req, res) => {
     broadcast('credits', { wallet, total: next });
     return res.json({ ok: true, wallet, total: next });
   } catch (e: any) {
-    console.error('/credits/settle error', e?.message || e);
-    return res
-      .status(500)
-      .json({ ok: false, error: 'internal_error' });
+    return res.status(500).json({ ok: false, error: 'internal_error' });
   }
+});
+
+app.post('/pute/deposit', (req, res) => {
+  try {
+    const wallet = String(req.body?.wallet || '');
+    const lamportsRaw = req.body?.lamports;
+    const modelId = req.body?.modelId || null;
+    const uiTxId = req.body?.uiTxId || null;
+    const lamports = Number(lamportsRaw || 0);
+
+    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet_required' });
+    if (!Number.isFinite(lamports) || lamports <= 0) return res.status(400).json({ ok: false, error: 'bad_lamports' });
+
+    const tx = db.transaction(() => {
+      const curRow = getCredit.get(wallet) as any;
+      const cur = Math.max(0, Number(curRow?.total ?? 0));
+      const next = cur + Math.floor(lamports);
+      upsertCredit.run({ wallet, total: next });
+      return next;
+    });
+
+    const total = tx();
+    broadcast('credits', { kind: 'deposit', wallet, total, lamports, modelId, uiTxId });
+    return res.json({ ok: true, wallet, total });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+app.post('/pute/faucet', (req, res) => {
+  try {
+    const wallet = String(req.body?.wallet || '');
+    let units = Number(req.body?.units || 20);
+    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet_required' });
+    if (!Number.isFinite(units) || units <= 0) units = 20;
+
+    const UNIT = Number(process.env.PUTE_FAUCET_UNIT || 10_000_000);
+    const inc = Math.floor(units * UNIT);
+
+    const curRow = getCredit.get(wallet) as any;
+    const cur = Math.max(0, Number(curRow?.total ?? 0));
+    const next = cur + inc;
+
+    upsertCredit.run({ wallet, total: next });
+    broadcast('credits', { kind: 'faucet', wallet, total: next, added: inc });
+    return res.json({ ok: true, wallet, total: next, added: inc });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+app.get('/pute/balance/:wallet', (req, res) => {
+  const w = String(req.params.wallet || '');
+  const row = getCredit.get(w) as any;
+  res.json({ wallet: w, total: row?.total || 0 });
 });
 
 app.get('/shares/recent', (req, res) => {
   const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
-  const items = getRecent.all({ limit }) as Array<{
-    wallet: string;
-    hostId: string;
-    deviceId: string;
-    difficulty: number;
-    ts: number;
-  }>;
+  const items = getRecent.all({ limit }) as any[];
   res.json({ items });
 });
 
 app.get('/stats', (_req, res) => {
-  const row = getStats.get() as {
-    totalShares: number;
-    totalWallets: number;
-    lastShareTs: number | null;
-  };
+  const row = getStats.get() as any;
   res.json({
     totalShares: row.totalShares || 0,
     totalWallets: row.totalWallets || 0,
@@ -533,46 +449,18 @@ app.get('/stats', (_req, res) => {
 // ---------- Host read APIs ---------------------------------------------------
 app.get('/host-state', (req, res) => {
   const hostId = String(req.query.hostId || '');
-  if (!hostId)
-    return res.status(400).json({ error: 'hostId required' });
+  if (!hostId) return res.status(400).json({ error: 'hostId required' });
 
-  const row = db
-    .prepare(
-      `
-    SELECT enabled,
-           owner_wallet,
-           controller_wallet,
-           attached_wallet,
-           attached_device_id,
-           site_label,
-           gpu_reported_model,
-           gpu_verified
-    FROM hosts WHERE host_id=?`,
-    )
-    .get(hostId) as
-    | {
-        enabled: number;
-        owner_wallet: string;
-        controller_wallet?: string | null;
-        attached_wallet?: string | null;
-        attached_device_id?: string | null;
-        site_label?: string | null;
-        gpu_reported_model?: string | null;
-        gpu_verified?: number | null;
-      }
-    | undefined;
+  const row = db.prepare(`
+    SELECT enabled, owner_wallet, controller_wallet, attached_wallet, attached_device_id,
+           site_label, gpu_reported_model, gpu_verified
+    FROM hosts WHERE host_id=?`
+  ).get(hostId) as any;
 
   if (!row) {
     return res.json({
-      hostId,
-      enabled: false,
-      wallet: null,
-      controller: null,
-      attached: null,
-      deviceId: null,
-      site: null,
-      gpuReportedModel: null,
-      gpuVerified: false,
+      hostId, enabled: false, wallet: null, controller: null, attached: null,
+      deviceId: null, site: null, gpuReportedModel: null, gpuVerified: false,
     });
   }
 
@@ -591,45 +479,23 @@ app.get('/host-state', (req, res) => {
 
 app.get('/host/last-share', (req, res) => {
   const hostId = String(req.query.hostId || '');
-  if (!hostId)
-    return res.status(400).json({ error: 'hostId required' });
+  if (!hostId) return res.status(400).json({ error: 'hostId required' });
 
   const cutoff = Date.now() - 5 * 60 * 1000; // last 5 minutes
-  const row = db
-    .prepare(
-      `
-    SELECT
-      MAX(ts) as lastShareTs,
-      MIN(ts) as firstTs,
-      SUM(difficulty) as sumDiff
-    FROM shares
-    WHERE host_id = ?
-      AND ts >= ?
-  `,
-    )
-    .get(hostId, cutoff) as
-    | { lastShareTs: number | null; firstTs: number | null; sumDiff: number | null }
-    | undefined;
+  const row = db.prepare(`
+    SELECT MAX(ts) as lastShareTs, MIN(ts) as firstTs, SUM(difficulty) as sumDiff
+    FROM shares WHERE host_id = ? AND ts >= ?`
+  ).get(hostId, cutoff) as any;
 
   let hashRate: number | null = null;
-  if (
-    row?.lastShareTs &&
-    row.firstTs &&
-    row.sumDiff &&
-    row.lastShareTs > row.firstTs
-  ) {
+  if (row?.lastShareTs && row.firstTs && row.sumDiff && row.lastShareTs > row.firstTs) {
     const seconds = (row.lastShareTs - row.firstTs) / 1000;
     hashRate = row.sumDiff / Math.max(1, seconds);
   }
 
-  res.json({
-    hostId,
-    lastShareTs: row?.lastShareTs ?? null,
-    hashRate,
-  });
+  res.json({ hostId, lastShareTs: row?.lastShareTs ?? null, hashRate });
 });
 
-// Marketplace (enabled + device bound)
 app.get('/market/hosts', (_req, res) => {
   try {
     const hosts = getMarketHosts.all();
@@ -639,129 +505,53 @@ app.get('/market/hosts', (_req, res) => {
   }
 });
 
-// Register / change owner via UI
 app.post('/host/register', (req, res) => {
   const { hostId, ownerWallet } = req.body || {};
-  if (!hostId || !ownerWallet)
-    return res
-      .status(400)
-      .json({ error: 'hostId and ownerWallet required' });
-  db.prepare(
-    `
-    INSERT INTO hosts (host_id, owner_wallet, enabled)
-    VALUES (?, ?, 0)
-    ON CONFLICT(host_id) DO UPDATE SET owner_wallet = excluded.owner_wallet
-  `,
+  if (!hostId || !ownerWallet) return res.status(400).json({ error: 'hostId and ownerWallet required' });
+  db.prepare(`
+    INSERT INTO hosts (host_id, owner_wallet, enabled) VALUES (?, ?, 0)
+    ON CONFLICT(host_id) DO UPDATE SET owner_wallet = excluded.owner_wallet`
   ).run(hostId, ownerWallet);
   res.json({ ok: true, hostId, ownerWallet });
 });
 
-// Attach designated mining wallet (optional)
 app.post('/host/attach', (req, res) => {
   const { hostId, attachedWallet } = req.body || {};
-  if (!hostId)
-    return res.status(400).json({ error: 'hostId required' });
-  db.prepare(
-    `UPDATE hosts SET attached_wallet=? WHERE host_id=?`,
-  ).run(attachedWallet || null, hostId);
+  if (!hostId) return res.status(400).json({ error: 'hostId required' });
+  db.prepare(`UPDATE hosts SET attached_wallet=? WHERE host_id=?`).run(attachedWallet || null, hostId);
   broadcast('host', { hostId });
-  res.json({
-    ok: true,
-    hostId,
-    attachedWallet: attachedWallet || null,
-  });
+  res.json({ ok: true, hostId, attachedWallet: attachedWallet || null });
 });
 
-// Manual server enable/disable (NO paywall anymore)
 app.post('/host/enable', (req, res) => {
   const { hostId } = req.body || {};
-  if (!hostId)
-    return res.status(400).json({ error: 'hostId required' });
-  const r = db
-    .prepare(`UPDATE hosts SET enabled=1 WHERE host_id=?`)
-    .run(hostId);
-  if (r.changes === 0)
-    return res.status(404).json({ error: 'host_not_registered' });
+  if (!hostId) return res.status(400).json({ error: 'hostId required' });
+  const r = db.prepare(`UPDATE hosts SET enabled=1 WHERE host_id=?`).run(hostId);
+  if (r.changes === 0) return res.status(404).json({ error: 'host_not_registered' });
   broadcast('host', { hostId, enabled: true });
   res.json({ ok: true, hostId, enabled: true });
 });
 
 app.post('/host/disable', (req, res) => {
   const { hostId } = req.body || {};
-  if (!hostId)
-    return res.status(400).json({ error: 'hostId required' });
-  const r = db
-    .prepare(`UPDATE hosts SET enabled=0 WHERE host_id=?`)
-    .run(hostId);
-  if (r.changes === 0)
-    return res.status(404).json({ error: 'host_not_registered' });
+  if (!hostId) return res.status(400).json({ error: 'hostId required' });
+  const r = db.prepare(`UPDATE hosts SET enabled=0 WHERE host_id=?`).run(hostId);
+  if (r.changes === 0) return res.status(404).json({ error: 'host_not_registered' });
   broadcast('host', { hostId, enabled: false });
   res.json({ ok: true, hostId, enabled: false });
 });
 
-// ---------- PUTE credits: deposit + balance ----------------------------------
-
-// For now, 1 lamport = 1 PUTE unit (you can change this later with an env).
-// If you want a different rate, set PUTE_PER_LAMPORT in the environment.
-const PUTE_PER_LAMPORT = Number(process.env.PUTE_PER_LAMPORT || '1');
-
-app.post('/pute/deposit', (req, res) => {
-  try {
-    const wallet = String(req.body?.wallet || '');
-    const lamportsRaw = req.body?.lamports;
-    const modelId = req.body?.modelId || null;
-    const uiTxId = req.body?.uiTxId || null;
-
-    const lamports = Number(lamportsRaw);
-    if (!wallet) {
-      return res.status(400).json({ ok: false, error: 'wallet_required' });
-    }
-    if (!Number.isFinite(lamports) || lamports <= 0) {
-      return res.status(400).json({ ok: false, error: 'bad_amount' });
-    }
-
-    const minted = Math.floor(lamports * PUTE_PER_LAMPORT);
-
-    const row = getPuteCredit.get(wallet) as { total?: number } | undefined;
-    const cur = Math.max(0, Number(row?.total ?? 0));
-    const next = cur + minted;
-
-    upsertPuteCredit.run({ wallet, total: next });
-
-    return res.json({
-      ok: true,
-      wallet,
-      lamports,
-      minted,
-      total: next,
-      modelId,
-      uiTxId,
-    });
-  } catch (e: any) {
-    console.error('/pute/deposit error', e?.message || e);
-    return res
-      .status(500)
-      .json({ ok: false, error: 'internal_error' });
-  }
-});
-
 app.get('/pute/:wallet', (req, res) => {
   const wallet = String(req.params.wallet || '');
-  if (!wallet) {
-    return res.status(400).json({ ok: false, error: 'wallet_required' });
-  }
-  const row = getPuteCredit.get(wallet) as { total?: number } | undefined;
+  if (!wallet) return res.status(400).json({ ok: false, error: 'wallet_required' });
+  const row = getPuteCredit.get(wallet) as any;
   const total = Math.max(0, Number(row?.total ?? 0));
   res.json({ ok: true, wallet, total });
 });
 
 // ---------- On-chain START/STOP verify via Memo ------------------------------
-const RPC_URL =
-  process.env.SOLANA_RPC || 'https://api.devnet.solana.com';
-const MEMO_PROGRAM = new PublicKey(
-  process.env.MEMO_PROGRAM_ID ||
-    'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr',
-);
+const RPC_URL = process.env.SOLANA_RPC || 'https://api.devnet.solana.com';
+const MEMO_PROGRAM = new PublicKey(process.env.MEMO_PROGRAM_ID || 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
 const conn = new Connection(RPC_URL, { commitment: 'confirmed' });
 
 function extractMemos(tx: VersionedTransactionResponse): string[] {
@@ -796,78 +586,188 @@ function extractMemos(tx: VersionedTransactionResponse): string[] {
 
 app.post('/onchain/verify', async (req, res) => {
   const { sig, hostId } = req.body || {};
-  if (!sig || !hostId)
-    return res
-      .status(400)
-      .json({ ok: false, error: 'sig_and_hostId_required' });
+  if (!sig || !hostId) return res.status(400).json({ ok: false, error: 'sig_and_hostId_required' });
 
-  const row = db
-    .prepare(
-      `SELECT owner_wallet, controller_wallet FROM hosts WHERE host_id=?`,
-    )
-    .get(hostId) as
-    | { owner_wallet?: string; controller_wallet?: string | null }
-    | undefined;
-
-  if (!row?.owner_wallet)
-    return res
-      .status(404)
-      .json({ ok: false, error: 'host_not_registered' });
+  const row = db.prepare(`SELECT owner_wallet, controller_wallet FROM hosts WHERE host_id=?`).get(hostId) as any;
+  if (!row?.owner_wallet) return res.status(404).json({ ok: false, error: 'host_not_registered' });
 
   const controller = row.controller_wallet || row.owner_wallet;
-
   let tx: VersionedTransactionResponse | null = null;
   try {
-    tx = await conn.getTransaction(sig, {
-      commitment: 'confirmed',
-      maxSupportedTransactionVersion: 0,
-    });
-  } catch {
-    return res.status(400).json({ ok: false, error: 'rpc_error' });
-  }
-  if (!tx)
-    return res.status(400).json({ ok: false, error: 'missing_tx' });
+    tx = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+  } catch { return res.status(400).json({ ok: false, error: 'rpc_error' }); }
+  if (!tx) return res.status(400).json({ ok: false, error: 'missing_tx' });
 
-  const feePayer =
-    tx.transaction.message.getAccountKeys().staticAccountKeys[0];
-  if (!feePayer?.equals(new PublicKey(controller))) {
-    return res
-      .status(403)
-      .json({ ok: false, error: 'not_signed_by_controller' });
-  }
+  const feePayer = tx.transaction.message.getAccountKeys().staticAccountKeys[0];
+  if (!feePayer?.equals(new PublicKey(controller))) return res.status(403).json({ ok: false, error: 'not_signed_by_controller' });
 
   const memo = extractMemos(tx).find((m) => m.startsWith('MINER|'));
-  if (!memo)
-    return res.status(400).json({ ok: false, error: 'memo_missing' });
+  if (!memo) return res.status(400).json({ ok: false, error: 'memo_missing' });
 
-  const [, action, memoHost] = memo.split('|'); // MINER|START|HOST|ts
-  if (memoHost !== hostId)
-    return res
-      .status(400)
-      .json({ ok: false, error: 'host_mismatch' });
+  const [, action, memoHost] = memo.split('|'); 
+  if (memoHost !== hostId) return res.status(400).json({ ok: false, error: 'host_mismatch' });
 
   const enabled = action === 'START' ? 1 : 0;
-  db.prepare(`UPDATE hosts SET enabled=? WHERE host_id=?`).run(
-    enabled,
-    hostId,
-  );
-
+  db.prepare(`UPDATE hosts SET enabled=? WHERE host_id=?`).run(enabled, hostId);
   broadcast('host', { hostId, enabled: enabled === 1 });
   res.json({ ok: true, hostId, enabled: enabled === 1, sig });
 });
 
-// ---------- health -----------------------------------------------------------
 app.get('/healthz', (_req, res) => {
-  res.json({
-    ok: true,
-    uptime: process.uptime(),
-    pid: process.pid,
-    dbPath: DB_PATH,
-  });
+  res.json({ ok: true, uptime: process.uptime(), pid: process.pid, dbPath: DB_PATH });
 });
 
 app.get('/ai/models', (_req, res) => {
   res.json({ models: AI_MODELS });
+});
+
+// ---------- AI JOB QUEUE -----------------------------------------
+app.post('/ai/jobs', (req, res) => {
+  try {
+    const { wallet, modelId, prompt, hostId } = req.body || {};
+    if (!wallet || !modelId || !prompt) return res.status(400).json({ ok: false, error: 'wallet, modelId, prompt required' });
+
+    const now = Date.now();
+    const info = insertAiJob.run({
+      wallet: String(wallet), modelId: String(modelId), hostId: hostId ? String(hostId) : null,
+      prompt: String(prompt), status: 'queued', createdTs: now, updatedTs: now,
+    });
+    return res.json({ ok: true, id: Number(info.lastInsertRowid) });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: 'ai_jobs_internal_error' });
+  }
+});
+
+app.get('/ai/jobs/next', (req, res) => {
+  try {
+    const hostId = String(req.query.hostId || '');
+    const deviceId = String(req.query.deviceId || '');
+    if (!hostId) return res.status(400).json({ ok: false, error: 'hostId_required' });
+
+    const now = Date.now();
+    const row = claimNextAiJob.get({ hostId, deviceId: deviceId || null, now }) as any;
+    return res.json({ ok: true, job: row || null });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: 'ai_jobs_next_internal_error' });
+  }
+});
+
+app.get('/ai/jobs/:id', (req, res) => {
+  try {
+    const id = Number(req.params.id || 0);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_job_id' });
+    const row = getAiJob.get(id) as any;
+    if (!row) return res.status(404).json({ ok: false, error: 'job_not_found' });
+    return res.json({ ok: true, job: row });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: 'ai_jobs_get_internal_error' });
+  }
+});
+
+app.post('/ai/jobs/:id/result', (req, res) => {
+  try {
+    const id = Number(req.params.id || 0);
+    const { result, error } = req.body || {};
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_job_id' });
+
+    const row = getAiJob.get(id) as any;
+    if (!row) return res.status(404).json({ ok: false, error: 'job_not_found' });
+
+    const now = Date.now();
+    const status = error ? 'failed' : 'completed';
+    completeAiJob.run({ id, status, result: result ?? null, error: error ?? null, now });
+    return res.json({ ok: true, id, status });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: 'ai_jobs_result_internal_error' });
+  }
+});
+
+// ---------------------------------------------------------
+// 📱 REMOTE CONTROL (PHONE LAUNCHER)
+// ---------------------------------------------------------
+app.get('/remote', (req, res) => {
+  const isRunning = !!minerProcess;
+  const statusColor = isRunning ? '#00ff9d' : '#ff4444';
+  const statusText = isRunning ? 'ONLINE 🟢' : 'OFFLINE 🔴';
+
+  res.send(`
+    <html>
+      <head>
+        <title>Skyline Command</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+        <style>
+          body { background: #050505; color: #fff; font-family: 'Courier New', monospace; text-align: center; padding: 40px 20px; }
+          h1 { margin-bottom: 40px; text-transform: uppercase; letter-spacing: 2px; }
+          .card { border: 1px solid #333; padding: 30px; border-radius: 20px; background: #111; max-width: 400px; margin: 0 auto; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+          .status { font-size: 24px; font-weight: bold; margin-bottom: 30px; color: ${statusColor}; text-shadow: 0 0 10px ${statusColor}; }
+          button { 
+            width: 100%; padding: 25px; font-size: 18px; font-weight: bold;
+            margin-bottom: 20px; border: none; border-radius: 12px; cursor: pointer; text-transform: uppercase;
+          }
+          .btn-start { background: #00ff9d; color: #000; box-shadow: 0 0 15px #00ff9d50; }
+          .btn-stop { background: #ff4444; color: #fff; box-shadow: 0 0 15px #ff444450; }
+          .log { margin-top: 20px; color: #666; font-size: 12px; }
+        </style>
+      </head>
+      <body>
+        <h1>NYC Skyline<br>Command Node</h1>
+        <div class="card">
+          <div class="status">${statusText}</div>
+          
+          ${!isRunning ? `
+            <form action="/remote/start" method="POST">
+              <button class="btn-start">⚡ Ignite Miner</button>
+            </form>
+          ` : `
+            <form action="/remote/stop" method="POST">
+              <button class="btn-stop">🛑 Shutdown</button>
+            </form>
+          `}
+          
+          <div class="log">Miner Path: ${MINER_PATH}</div>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+app.post('/remote/start', (req, res) => {
+  if (minerProcess) return res.redirect('/remote');
+  console.log('[Remote] 📱 Phone requested Miner START...');
+  
+  try {
+    minerProcess = spawn('npm.cmd', ['run', 'dev'], { cwd: MINER_PATH, shell: true });
+    minerProcess.stdout?.on('data', (data) => console.log(`[Miner] ${data}`));
+    minerProcess.stderr?.on('data', (data) => console.error(`[Miner Error] ${data}`));
+    minerProcess.on('close', () => {
+      console.log('[Remote] Miner process exited.');
+      minerProcess = null;
+    });
+  } catch (err) {
+    console.error('[Remote] Failed to spawn:', err);
+  }
+
+  setTimeout(() => res.redirect('/remote'), 2000);
+});
+
+app.post('/remote/stop', (req, res) => {
+  if (minerProcess) {
+    console.log('[Remote] 📱 Phone requested Miner STOP...');
+    try {
+        spawn("taskkill", ["/pid", String(minerProcess.pid), '/f', '/t']);
+    } catch (err) { console.error('[Remote] Kill failed', err); }
+    minerProcess = null;
+  }
+  res.redirect('/remote');
+});
+
+// --- SAFETY NET: Global Error Handler (Prevents HTML Leaks) ---
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('[Server Error]', err);
+  // Ensure we send JSON so the DApp doesn't break with "Unexpected token <"
+  if (!res.headersSent) {
+    res.status(500).json({ ok: false, error: 'internal_server_error', details: err.message });
+  }
 });
 
 const port = process.env.PORT || 8787;
@@ -875,140 +775,3 @@ app.listen(port, () => {
   console.log(`[db] coordinator listening on :${port}`);
   console.log(`[db] DB: ${DB_PATH}`);
 });
-
-// ---------- AI JOB QUEUE (LLM work) -----------------------------------------
-
-/**
- * Enqueue a new AI job from the UI.
- * body: { wallet, modelId, prompt, hostId? }
- */
-app.post('/ai/jobs', (req, res) => {
-  try {
-    const { wallet, modelId, prompt, hostId } = req.body || {};
-    if (!wallet || !modelId || !prompt) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'wallet, modelId, prompt required' });
-    }
-
-    const now = Date.now();
-    const info = insertAiJob.run({
-      wallet: String(wallet),
-      modelId: String(modelId),
-      hostId: hostId ? String(hostId) : null,
-      prompt: String(prompt),
-      status: 'queued',
-      createdTs: now,
-      updatedTs: now,
-    });
-
-    const id = Number(info.lastInsertRowid);
-    return res.json({ ok: true, id });
-  } catch (e: any) {
-    console.error('/ai/jobs error', e?.message || e);
-    return res
-      .status(500)
-      .json({ ok: false, error: 'ai_jobs_internal_error' });
-  }
-});
-
-/**
- * Claim the next queued job for a given host/device.
- * query: ?hostId=HOST-...&deviceId=...
- */
-app.get('/ai/jobs/next', (req, res) => {
-  try {
-    const hostId = String(req.query.hostId || '');
-    const deviceId = String(req.query.deviceId || '');
-    if (!hostId) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'hostId_required' });
-    }
-
-    const now = Date.now();
-    const row = claimNextAiJob.get({
-      hostId,
-      deviceId: deviceId || null,
-      now,
-    }) as any | undefined;
-
-    return res.json({
-      ok: true,
-      job: row || null,
-    });
-  } catch (e: any) {
-    console.error('/ai/jobs/next error', e?.message || e);
-    return res
-      .status(500)
-      .json({ ok: false, error: 'ai_jobs_next_internal_error' });
-  }
-});
-
-/**
- * Fetch job by id (for UI polling).
- */
-app.get('/ai/jobs/:id', (req, res) => {
-  try {
-    const id = Number(req.params.id || 0);
-    if (!Number.isFinite(id) || id <= 0) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'bad_job_id' });
-    }
-    const row = getAiJob.get(id) as any | undefined;
-    if (!row) {
-      return res
-        .status(404)
-        .json({ ok: false, error: 'job_not_found' });
-    }
-    return res.json({ ok: true, job: row });
-  } catch (e: any) {
-    console.error('/ai/jobs/:id error', e?.message || e);
-    return res
-      .status(500)
-      .json({ ok: false, error: 'ai_jobs_get_internal_error' });
-  }
-});
-
-/**
- * Worker posts back result when done.
- * body: { result?: string, error?: string }
- */
-app.post('/ai/jobs/:id/result', (req, res) => {
-  try {
-    const id = Number(req.params.id || 0);
-    const { result, error } = req.body || {};
-    if (!Number.isFinite(id) || id <= 0) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'bad_job_id' });
-    }
-
-    const row = getAiJob.get(id) as any | undefined;
-    if (!row) {
-      return res
-        .status(404)
-        .json({ ok: false, error: 'job_not_found' });
-    }
-
-    const now = Date.now();
-    const status = error ? 'failed' : 'completed';
-
-    completeAiJob.run({
-      id,
-      status,
-      result: result ?? null,
-      error: error ?? null,
-      now,
-    });
-
-    return res.json({ ok: true, id, status });
-  } catch (e: any) {
-    console.error('/ai/jobs/:id/result error', e?.message || e);
-    return res
-      .status(500)
-      .json({ ok: false, error: 'ai_jobs_result_internal_error' });
-  }
-});
-
